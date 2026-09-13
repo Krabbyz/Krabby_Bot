@@ -135,6 +135,102 @@ def humans_in_channel(vchan: discord.VoiceChannel) -> int:
     return sum(1 for m in vchan.members if not getattr(m, "bot", False))
 
 
+def human_members_in_channel(vchan: discord.VoiceChannel) -> list[discord.Member]:
+    return [m for m in vchan.members if not getattr(m, "bot", False)]
+
+
+def member_name(member: discord.Member) -> str:
+    return member.display_name or member.name
+
+
+def make_session(vchan: discord.VoiceChannel, started_at: Optional[datetime] = None) -> dict:
+    started_at = started_at or now_utc()
+    started_iso = started_at.isoformat()
+    users = {}
+    for member in human_members_in_channel(vchan):
+        users[str(member.id)] = {
+            "name": member_name(member),
+            "total_seconds": 0,
+            "joined_at": started_iso,
+        }
+    return {"started_at": started_iso, "users": users}
+
+
+def coerce_session(vchan: discord.VoiceChannel, raw_session) -> dict:
+    if isinstance(raw_session, dict):
+        raw_session.setdefault("started_at", now_utc().isoformat())
+        users = raw_session.setdefault("users", {})
+        if not isinstance(users, dict):
+            raw_session["users"] = {}
+        return raw_session
+
+    if isinstance(raw_session, str):
+        try:
+            started_at = datetime.fromisoformat(raw_session)
+        except Exception:
+            started_at = now_utc()
+        return make_session(vchan, started_at)
+
+    return make_session(vchan)
+
+
+def track_member_join(session: dict, member: discord.Member, joined_at: datetime):
+    user_id = str(member.id)
+    users = session.setdefault("users", {})
+    user = users.setdefault(
+        user_id,
+        {"name": member_name(member), "total_seconds": 0, "joined_at": None},
+    )
+    user["name"] = member_name(member)
+    if not user.get("joined_at"):
+        user["joined_at"] = joined_at.isoformat()
+
+
+def track_member_leave(session: dict, member: discord.Member, left_at: datetime):
+    users = session.setdefault("users", {})
+    user = users.get(str(member.id))
+    if not isinstance(user, dict):
+        return
+
+    joined_iso = user.get("joined_at")
+    if not joined_iso:
+        return
+
+    try:
+        joined_at = datetime.fromisoformat(joined_iso)
+    except Exception:
+        joined_at = left_at
+
+    elapsed = int((left_at - joined_at).total_seconds())
+    user["total_seconds"] = int(user.get("total_seconds", 0)) + max(0, elapsed)
+    user["joined_at"] = None
+    user["name"] = member_name(member)
+
+
+def finalize_user_totals(session: dict, ended_at: datetime) -> list[dict]:
+    totals = []
+    for user in session.get("users", {}).values():
+        if not isinstance(user, dict):
+            continue
+
+        total_seconds = int(user.get("total_seconds", 0))
+        joined_iso = user.get("joined_at")
+        if joined_iso:
+            try:
+                joined_at = datetime.fromisoformat(joined_iso)
+            except Exception:
+                joined_at = ended_at
+            total_seconds += max(0, int((ended_at - joined_at).total_seconds()))
+
+        if total_seconds > 0:
+            totals.append({
+                "name": user.get("name") or "Unknown user",
+                "seconds": total_seconds,
+            })
+
+    return sorted(totals, key=lambda row: (-row["seconds"], row["name"].lower()))
+
+
 async def ensure_log_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
     conf = DATA.setdefault("guilds", {}).get(str(guild.id), {})
     ch_id = conf.get("log_channel_id")
@@ -159,14 +255,25 @@ def can_pin_in(channel: discord.TextChannel) -> bool:
     return perms.manage_messages and perms.read_messages and perms.read_message_history and perms.send_messages
 
 
-async def post_and_maybe_pin(guild: discord.Guild, vchan: discord.VoiceChannel, seconds: int):
+def build_log_content(vchan: discord.VoiceChannel, date_str: str, seconds: int, user_totals: list[dict]) -> str:
+    lines = [f"[{vchan.name}] [{date_str}] {fmt_duration(seconds)}"]
+    lines.extend(f"     {row['name']}: {fmt_duration(row['seconds'])}" for row in user_totals)
+    return "\n".join(lines)
+
+
+async def post_and_maybe_pin(
+    guild: discord.Guild,
+    vchan: discord.VoiceChannel,
+    seconds: int,
+    user_totals: list[dict],
+):
     log_channel = await ensure_log_channel(guild)
     if not log_channel:
         print(f"[WARN] No log channel set for guild {guild.id}")
         return
 
     date_str = now_utc().strftime("%m/%d/%Y")
-    content = f"[{vchan.name}] [{date_str}] {fmt_duration(seconds)}"
+    content = build_log_content(vchan, date_str, seconds, user_totals)
     msg = await log_channel.send(content)
 
     gid = str(guild.id)
@@ -207,20 +314,29 @@ async def post_and_maybe_pin(guild: discord.Guild, vchan: discord.VoiceChannel, 
 async def evaluate_channel(vchan: discord.VoiceChannel):
     ch_id = str(vchan.id)
     occupied = humans_in_channel(vchan) >= 1
-    start_iso = DATA.setdefault("active", {}).get(ch_id)
+    active = DATA.setdefault("active", {})
+    raw_session = active.get(ch_id)
 
-    if occupied and start_iso is None:
-        DATA["active"][ch_id] = now_utc().isoformat()
+    if occupied and raw_session is None:
+        active[ch_id] = make_session(vchan)
         save_data()
-    elif not occupied and start_iso is not None:
+    elif raw_session is not None:
+        session = coerce_session(vchan, raw_session)
+        active[ch_id] = session
+        if occupied:
+            save_data()
+            return
+
+        ended_at = now_utc()
         try:
-            start = datetime.fromisoformat(start_iso)
+            start = datetime.fromisoformat(session.get("started_at", ended_at.isoformat()))
         except Exception:
-            start = now_utc()
-        elapsed = int((now_utc() - start).total_seconds())
-        DATA["active"].pop(ch_id, None)
+            start = ended_at
+        elapsed = int((ended_at - start).total_seconds())
+        user_totals = finalize_user_totals(session, ended_at)
+        active.pop(ch_id, None)
         save_data()
-        await post_and_maybe_pin(vchan.guild, vchan, elapsed)
+        await post_and_maybe_pin(vchan.guild, vchan, elapsed, user_totals)
 
 
 # ---- Events -----------------------------------------------------------------
@@ -232,9 +348,11 @@ async def on_ready():
         for vchan in guild.voice_channels:
             try:
                 if humans_in_channel(vchan) >= 1 and str(vchan.id) not in DATA.setdefault("active", {}):
-                    DATA["active"][str(vchan.id)] = now_utc().isoformat()
+                    DATA["active"][str(vchan.id)] = make_session(vchan)
                 elif humans_in_channel(vchan) == 0 and str(vchan.id) in DATA.setdefault("active", {}):
                     DATA["active"].pop(str(vchan.id), None)
+                elif str(vchan.id) in DATA.setdefault("active", {}):
+                    DATA["active"][str(vchan.id)] = coerce_session(vchan, DATA["active"][str(vchan.id)])
             except Exception:
                 pass
     save_data()
@@ -247,12 +365,37 @@ async def on_ready():
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    touched: set[discord.VoiceChannel] = set()
-    if before and before.channel and isinstance(before.channel, discord.VoiceChannel):
-        touched.add(before.channel)
-    if after and after.channel and isinstance(after.channel, discord.VoiceChannel):
-        touched.add(after.channel)
-    for vchan in touched:
+    if getattr(member, "bot", False):
+        return
+
+    before_channel = before.channel if before and isinstance(before.channel, discord.VoiceChannel) else None
+    after_channel = after.channel if after and isinstance(after.channel, discord.VoiceChannel) else None
+
+    if before_channel == after_channel:
+        return
+
+    changed_at = now_utc()
+    active = DATA.setdefault("active", {})
+
+    if before_channel:
+        raw_session = active.get(str(before_channel.id))
+        if raw_session is not None:
+            session = coerce_session(before_channel, raw_session)
+            track_member_leave(session, member, changed_at)
+            active[str(before_channel.id)] = session
+            save_data()
+
+    if after_channel:
+        raw_session = active.get(str(after_channel.id))
+        if raw_session is not None:
+            session = coerce_session(after_channel, raw_session)
+            track_member_join(session, member, changed_at)
+            active[str(after_channel.id)] = session
+            save_data()
+
+    for vchan in (before_channel, after_channel):
+        if not vchan:
+            continue
         try:
             await evaluate_channel(vchan)
         except Exception as e:
